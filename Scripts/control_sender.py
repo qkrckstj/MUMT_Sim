@@ -59,12 +59,10 @@ while True:
         f"pitch={pitch_state:.3f}, roll={roll_state:.3f}, yaw={yaw_state:.3f}"
     )
 
-    # -----------------------------
-    # 다음 제어 명령 계산
-    # -----------------------------
+ 
     target_pitch = 5.0
 
-    # 속도 기준 throttle
+
     if speed_mps < 150.0:
         throttle = 1.0
     else:
@@ -80,7 +78,7 @@ while True:
     elif pitch_cmd < -1.0:
         pitch_cmd = -1.0
 
-    # 아까 테스트 결과 기준: pitch 축 반대로 적용
+
     pitch = -pitch_cmd
 
     roll = 0.0

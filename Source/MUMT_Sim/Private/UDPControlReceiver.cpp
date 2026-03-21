@@ -57,10 +57,10 @@ void AUDPControlReceiver::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
-    // 1) Python -> Unreal Á¦¾î ¼ö½Å
+    // 1) Python -> Unreal ?ì’–ë¼± ?ì„ë–Š
     ReceiveUDPData();
 
-    // 2) ´ë»ó Pawn È®º¸
+    // 2) ?Â€??Pawn ?ëº£ë‚«
     if (!CachedTargetPawn || !IsValid(CachedTargetPawn))
     {
         CachedTargetPawn = FindTargetPawn();
@@ -70,7 +70,7 @@ void AUDPControlReceiver::Tick(float DeltaTime)
         }
     }
 
-    // 3) ¼ö½Å°ªÀ» Blueprint º¯¼ö¿¡ ¹Ý¿µ
+    // 3) ?ì„ë–Šåª›ë¯ªì“£ Blueprint è¹‚Â€?ì„ë¿‰ è«›ì„ìº
     const bool bRollOk = SetBlueprintNumber(CachedTargetPawn, TEXT("UDP_Roll"), Roll);
     const bool bPitchOk = SetBlueprintNumber(CachedTargetPawn, TEXT("UDP_Pitch"), Pitch);
     const bool bYawOk = SetBlueprintNumber(CachedTargetPawn, TEXT("UDP_Yaw"), Yaw);
@@ -88,7 +88,7 @@ void AUDPControlReceiver::Tick(float DeltaTime)
             *CachedTargetPawn->GetName());
     }
 
-    // 4) Unreal -> Python »óÅÂ ¼Û½Å
+    // 4) Unreal -> Python ?ê³¹ê¹­ ?â‰ªë–Š
     StateSendAccumulator += DeltaTime;
     if (StateSendAccumulator >= StateSendInterval)
     {

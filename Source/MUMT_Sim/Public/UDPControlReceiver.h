@@ -21,48 +21,48 @@ protected:
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 private:
-    // ===== ¼ö½Å =====
+    // ===== ?ì„ë–Š =====
     bool StartUDPReceiver();
     void StopUDPReceiver();
     void ReceiveUDPData();
     void ParseCommand(const FString& Message);
 
-    // ===== ¼Û½Å =====
+    // ===== ?â‰ªë–Š =====
     bool StartUDPSender();
     void StopUDPSender();
     void SendStateToPython();
 
-    // ===== Pawn Ã³¸® =====
+    // ===== Pawn ï§£ì„â” =====
     APawn* FindTargetPawn();
     bool SetBlueprintNumber(APawn* Pawn, const FName VarName, double Value);
 
 private:
-    // ¼ö½Å¿ë ¼ÒÄÏ
+    // ?ì„ë–Š???ëš¯í†
     FSocket* ListenSocket = nullptr;
 
-    // ¼Û½Å¿ë ¼ÒÄÏ
+    // ?â‰ªë–Š???ëš¯í†
     FSocket* SendSocket = nullptr;
 
-    // Python ÁÖ¼Ò
+    // Python äºŒì‡±ëƒ¼
     TSharedPtr<FInternetAddr> PythonAddr;
 
-    // Ä³½ÃµÈ ´ë»ó Pawn
+    // ï§¦ë¨¯ë–†???Â€??Pawn
     APawn* CachedTargetPawn = nullptr;
 
-    // »óÅÂ ¼Û½Å Å¸ÀÌ¸Ó
+    // ?ê³¹ê¹­ ?â‰ªë–Š ?Â€?ëŒ€ã‰§
     float StateSendAccumulator = 0.0f;
 
-    // ¼Óµµ °è»ê¿ë ÀÌÀü »óÅÂ
+    // ?ë¾ë£„ æ€¨ê¾©ê¶›???ëŒìŸ¾ ?ê³¹ê¹­
     FVector PrevLocation = FVector::ZeroVector;
     bool bHasPrevLocation = false;
     double PrevStateSendTime = 0.0;
 
 public:
-    // ===== ¼ö½Å ¼³Á¤ =====
+    // ===== ?ì„ë–Š ?ã…¼ì ™ =====
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Receiver")
     int32 ListenPort = 5005;
 
-    // ===== ¼Û½Å ¼³Á¤ =====
+    // ===== ?â‰ªë–Š ?ã…¼ì ™ =====
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Sender")
     FString PythonIP = TEXT("127.0.0.1");
 
@@ -72,11 +72,11 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Sender")
     float StateSendInterval = 0.05f; // 20Hz
 
-    // ===== Á¦¾î ´ë»ó Pawn =====
+    // ===== ?ì’–ë¼± ?Â€??Pawn =====
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
     FString TargetPawnName = TEXT("F16_UAV");
 
-    // ===== ¼ö½ÅµÈ Á¶Á¾°ª =====
+    // ===== ?ì„ë–Š??è­°ê³—ì¥Œåª›?=====
     UPROPERTY(BlueprintReadOnly, Category = "UDP|Control")
     float Roll = 0.0f;
 
