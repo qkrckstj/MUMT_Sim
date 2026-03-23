@@ -1,89 +1,98 @@
-import socket
 import json
+import socket
+import time
 
 UDP_IP = "127.0.0.1"
 CONTROL_PORT = 5005
 STATE_PORT = 5006
 
-# Unreal로 명령 보내는 소켓
 send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-# Unreal에서 상태 받는 소켓
 recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 recv_sock.bind(("0.0.0.0", STATE_PORT))
 
-print("Closed-loop controller started")
+print("Multi-aircraft controller started")
+last_print_time = 0.0
 
-# -----------------------------
-# 0. 초기 명령 1번 송신
-# -----------------------------
-roll = 0.0
-pitch = 0.0
-yaw = 0.0
-throttle = 0.8
 
-msg = f"{roll},{pitch},{yaw},{throttle}"
-send_sock.sendto(msg.encode("utf-8"), (UDP_IP, CONTROL_PORT))
-print("initial sent:", msg)
+def recv_aircraft_list():
+    data, _ = recv_sock.recvfrom(65535)
+    payload = json.loads(data.decode("utf-8"))
+    if isinstance(payload, dict) and isinstance(payload.get("aircraft"), list):
+        return payload["aircraft"]
+    if isinstance(payload, dict):
+        return [payload]
+    return []
 
-# -----------------------------
-# 1. 상태 수신 -> 다음 명령 계산 -> 송신
-# -----------------------------
+
+def build_uav_command(name, aircraft):
+    speed_mps = aircraft.get("speed_mps", 0.0)
+    pitch_state = aircraft.get("pitch", 0.0)
+
+    target_pitch = 5.0
+    throttle = 1.0 if speed_mps < 150.0 else 0.6
+
+    pitch_error = target_pitch - pitch_state
+    pitch_cmd = max(-1.0, min(1.0, pitch_error * 0.1))
+
+    return {
+        "aircraft_name": name,
+        "roll": 0.0,
+        "pitch": -pitch_cmd,
+        "yaw": 0.0,
+        "throttle": throttle,
+    }
+
+
 while True:
-    data, addr = recv_sock.recvfrom(4096)
-    raw_msg = data.decode("utf-8")
-    print("state raw:", raw_msg)
-
-    try:
-        state = json.loads(raw_msg)
-    except Exception as e:
-        print("JSON parse error:", e)
+    aircraft_list = recv_aircraft_list()
+    if not aircraft_list:
         continue
 
-    # Unreal 새 코드 기준
-    speed_cmps = state["speed"]
-    speed_mps = state["speed_mps"]
-    speed_kph = state["speed_kph"]
+    should_print = (time.monotonic() - last_print_time) >= 1.0
+    if should_print:
+        last_print_time = time.monotonic()
+        print(f"received {len(aircraft_list)} aircraft")
 
-    pitch_state = state["pitch"]
-    roll_state = state["roll"]
-    yaw_state = state["yaw"]
-    x = state["x"]
-    y = state["y"]
-    z = state["z"]
+    uav_aircraft = []
+    for aircraft in aircraft_list:
+        name = aircraft.get("aircraft_name", "unknown")
+        team = aircraft.get("team")
+        speed_mps = aircraft.get("speed_mps")
+        throttle = aircraft.get("throttle")
+        x = aircraft.get("x")
+        y = aircraft.get("y")
+        z = aircraft.get("z")
+        pitch = aircraft.get("pitch")
+        roll = aircraft.get("roll")
+        yaw = aircraft.get("yaw")
+        weapons = aircraft.get("weapons", {})
+        bullet_ammo = weapons.get("bullet_ammo")
+        rocket_ammo = weapons.get("rocket_ammo")
 
-    print(
-        f"speed={speed_cmps:.3f} cm/s, "
-        f"{speed_mps:.3f} m/s, "
-        f"{speed_kph:.3f} km/h | "
-        f"pitch={pitch_state:.3f}, roll={roll_state:.3f}, yaw={yaw_state:.3f}"
-    )
+        if should_print:
+            print(
+                f"[{name}] "
+                f"pos=({x}, {y}, {z}) "
+                f"speed={speed_mps} "
+                f"pitch={pitch} roll={roll} yaw={yaw} "
+                f"throttle={throttle} "
+                f"team={team} "
+                f"bullet_ammo={bullet_ammo} rocket_ammo={rocket_ammo}"
+            )
 
- 
-    target_pitch = 5.0
+        if "UAV" in name:
+            uav_aircraft.append(aircraft)
 
+    commands = []
+    for aircraft in uav_aircraft[:2]:
+        commands.append(build_uav_command(aircraft["aircraft_name"], aircraft))
 
-    if speed_mps < 150.0:
-        throttle = 1.0
-    else:
-        throttle = 0.6
+    if not commands:
+        if should_print:
+            print("No UAV aircraft found to control")
+        continue
 
-    # pitch 오차 기반 제어
-    pitch_error = target_pitch - pitch_state
-    pitch_cmd = pitch_error * 0.1
-
-    # 제한
-    if pitch_cmd > 1.0:
-        pitch_cmd = 1.0
-    elif pitch_cmd < -1.0:
-        pitch_cmd = -1.0
-
-
-    pitch = -pitch_cmd
-
-    roll = 0.0
-    yaw = 0.0
-
-    msg = f"{roll},{pitch},{yaw},{throttle}"
-    send_sock.sendto(msg.encode("utf-8"), (UDP_IP, CONTROL_PORT))
-    print("next sent:", msg)
+    payload = {"commands": commands}
+    send_sock.sendto(json.dumps(payload).encode("utf-8"), (UDP_IP, CONTROL_PORT))
+    if should_print:
+        print("sent:", payload)

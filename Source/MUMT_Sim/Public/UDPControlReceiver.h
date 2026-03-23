@@ -1,11 +1,24 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Dom/JsonObject.h"
 #include "GameFramework/Actor.h"
-#include "Sockets.h"
-#include "SocketSubsystem.h"
 #include "IPAddress.h"
+#include "SocketSubsystem.h"
+#include "Sockets.h"
 #include "UDPControlReceiver.generated.h"
+
+class APawn;
+class UJSBSimMovementComponent;
+
+struct FRemoteControlCommand
+{
+    double Roll = 0.0;
+    double Pitch = 0.0;
+    double Yaw = 0.0;
+    double Throttle = 0.0;
+    bool bValid = false;
+};
 
 UCLASS()
 class MUMT_SIM_API AUDPControlReceiver : public AActor
@@ -21,48 +34,51 @@ protected:
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 private:
-    // ===== ?섏떊 =====
     bool StartUDPReceiver();
     void StopUDPReceiver();
     void ReceiveUDPData();
     void ParseCommand(const FString& Message);
+    bool ParseJsonCommand(const FString& Message);
+    void ParseLegacyCsvCommand(const FString& Message);
 
-    // ===== ?≪떊 =====
     bool StartUDPSender();
     void StopUDPSender();
     void SendStateToPython();
 
-    // ===== Pawn 泥섎━ =====
     APawn* FindTargetPawn();
+    TArray<APawn*> FindTargetPawns(const TArray<FString>& NamePatterns, int32 MaxCount = INDEX_NONE) const;
+    bool DoesPawnMatchPatterns(const APawn* Pawn, const TArray<FString>& NamePatterns) const;
+    bool IsUavPawn(const APawn* Pawn) const;
     bool SetBlueprintNumber(APawn* Pawn, const FName VarName, double Value);
+    bool ApplyControlCommandToPawn(APawn* Pawn, const FRemoteControlCommand& Command);
+
+    TSharedPtr<FJsonObject> BuildPawnState(APawn* Pawn);
+    bool TryGetBlueprintBool(APawn* Pawn, const FString& VarName, bool& OutValue) const;
+    bool TryGetBlueprintInt(APawn* Pawn, const FString& VarName, int32& OutValue) const;
+    bool TryGetBlueprintNumber(APawn* Pawn, const FString& VarName, double& OutValue) const;
+    bool TryGetBlueprintString(APawn* Pawn, const FString& VarName, FString& OutValue) const;
+    void AddOptionalBoolField(const TSharedPtr<FJsonObject>& JsonObject, const FString& JsonKey, APawn* Pawn, const FString& VarName) const;
+    void AddOptionalIntField(const TSharedPtr<FJsonObject>& JsonObject, const FString& JsonKey, APawn* Pawn, const FString& VarName) const;
+    void AddOptionalNumberField(const TSharedPtr<FJsonObject>& JsonObject, const FString& JsonKey, APawn* Pawn, const FString& VarName) const;
+    void AddOptionalStringField(const TSharedPtr<FJsonObject>& JsonObject, const FString& JsonKey, APawn* Pawn, const FString& VarName) const;
+    UJSBSimMovementComponent* FindJSBSimMovementComponent(APawn* Pawn) const;
 
 private:
-    // ?섏떊???뚯폆
     FSocket* ListenSocket = nullptr;
-
-    // ?≪떊???뚯폆
     FSocket* SendSocket = nullptr;
-
-    // Python 二쇱냼
     TSharedPtr<FInternetAddr> PythonAddr;
 
-    // 罹먯떆?????Pawn
     APawn* CachedTargetPawn = nullptr;
-
-    // ?곹깭 ?≪떊 ??대㉧
     float StateSendAccumulator = 0.0f;
 
-    // ?띾룄 怨꾩궛???댁쟾 ?곹깭
-    FVector PrevLocation = FVector::ZeroVector;
-    bool bHasPrevLocation = false;
-    double PrevStateSendTime = 0.0;
+    FRemoteControlCommand BroadcastCommand;
+    TMap<FString, FRemoteControlCommand> NamedControlCommands;
+    TArray<FRemoteControlCommand> IndexedControlCommands;
 
 public:
-    // ===== ?섏떊 ?ㅼ젙 =====
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Receiver")
     int32 ListenPort = 5005;
 
-    // ===== ?≪떊 ?ㅼ젙 =====
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Sender")
     FString PythonIP = TEXT("127.0.0.1");
 
@@ -70,13 +86,50 @@ public:
     int32 PythonStatePort = 5006;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Sender")
-    float StateSendInterval = 0.05f; // 20Hz
+    float StateSendInterval = 0.05f;
 
-    // ===== ?쒖뼱 ???Pawn =====
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
     FString TargetPawnName = TEXT("F16_UAV");
 
-    // ===== ?섏떊??議곗쥌媛?=====
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
+    TArray<FString> ObservedPawnNamePatterns = { TEXT("F16"), TEXT("UAV") };
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
+    TArray<FString> ControlledPawnNamePatterns = { TEXT("F16_UAV"), TEXT("UAV") };
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
+    FString UavNamePattern = TEXT("UAV");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|Target")
+    int32 MaxControlledUavs = 2;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|State Mapping")
+    FString TeamVarName = TEXT("Team");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|State Mapping")
+    FString LockTargetVarName = TEXT("LockTarget");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|State Mapping")
+    FString IsLockedVarName = TEXT("IsLocked");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|State Mapping")
+    FString IsDeadVarName = TEXT("isDead");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|State Mapping")
+    FString IsFiringBulletVarName = TEXT("isFiringBullet");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|State Mapping")
+    FString RocketSpawnedIdVarName = TEXT("RocketSpawnedID");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|State Mapping")
+    FString ShootingSpeedVarName = TEXT("shootingSpeed");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|State Mapping")
+    FString BulletAmmoVarName = TEXT("BulletAmmo");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "UDP|State Mapping")
+    FString RocketAmmoVarName = TEXT("RocketAmmo");
+
     UPROPERTY(BlueprintReadOnly, Category = "UDP|Control")
     float Roll = 0.0f;
 

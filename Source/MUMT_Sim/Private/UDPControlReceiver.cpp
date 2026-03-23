@@ -1,16 +1,22 @@
 #include "UDPControlReceiver.h"
 
-#include "Engine/Engine.h"
-#include "HAL/RunnableThread.h"
 #include "Common/UdpSocketBuilder.h"
-#include "Sockets.h"
-#include "SocketSubsystem.h"
-#include "IPAddress.h"
-
-#include "Kismet/GameplayStatics.h"
-#include "GameFramework/Pawn.h"
-#include "UObject/UnrealType.h"
+#include "Engine/Engine.h"
 #include "Engine/World.h"
+#include "GameFramework/Pawn.h"
+#include "IPAddress.h"
+#include "JSBSimMovementComponent.h"
+#include "Kismet/GameplayStatics.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
+#include "SocketSubsystem.h"
+#include "Sockets.h"
+#include "UObject/UnrealType.h"
+
+namespace
+{
+    constexpr double KnotToMetersPerSecond = 0.514444;
+}
 
 AUDPControlReceiver::AUDPControlReceiver()
 {
@@ -42,53 +48,39 @@ void AUDPControlReceiver::BeginPlay()
     CachedTargetPawn = FindTargetPawn();
     if (CachedTargetPawn)
     {
-        UE_LOG(LogTemp, Warning, TEXT("[UDP] Target Pawn found at BeginPlay: %s"), *CachedTargetPawn->GetName());
+        UE_LOG(LogTemp, Warning, TEXT("[UDP] Primary controlled pawn: %s"), *CachedTargetPawn->GetName());
     }
-    else
-    {
-        UE_LOG(LogTemp, Warning, TEXT("[UDP] Target Pawn not found at BeginPlay. TargetPawnName=%s"), *TargetPawnName);
-    }
-
-    bHasPrevLocation = false;
-    PrevStateSendTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
 }
 
 void AUDPControlReceiver::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
-    // 1) Python -> Unreal ?쒖뼱 ?섏떊
     ReceiveUDPData();
 
-    // 2) ???Pawn ?뺣낫
-    if (!CachedTargetPawn || !IsValid(CachedTargetPawn))
+    const TArray<APawn*> ControlledPawns = FindTargetPawns(ControlledPawnNamePatterns, MaxControlledUavs);
+    CachedTargetPawn = ControlledPawns.Num() > 0 ? ControlledPawns[0] : FindTargetPawn();
+
+    for (int32 Index = 0; Index < ControlledPawns.Num(); ++Index)
     {
-        CachedTargetPawn = FindTargetPawn();
-        if (!CachedTargetPawn)
+        APawn* Pawn = ControlledPawns[Index];
+        FRemoteControlCommand CommandToApply = BroadcastCommand;
+
+        if (const FRemoteControlCommand* NamedCommand = NamedControlCommands.Find(Pawn->GetName()))
         {
-            return;
+            CommandToApply = *NamedCommand;
+        }
+        else if (IndexedControlCommands.IsValidIndex(Index))
+        {
+            CommandToApply = IndexedControlCommands[Index];
+        }
+
+        if (CommandToApply.bValid)
+        {
+            ApplyControlCommandToPawn(Pawn, CommandToApply);
         }
     }
 
-    // 3) ?섏떊媛믪쓣 Blueprint 蹂?섏뿉 諛섏쁺
-    const bool bRollOk = SetBlueprintNumber(CachedTargetPawn, TEXT("UDP_Roll"), Roll);
-    const bool bPitchOk = SetBlueprintNumber(CachedTargetPawn, TEXT("UDP_Pitch"), Pitch);
-    const bool bYawOk = SetBlueprintNumber(CachedTargetPawn, TEXT("UDP_Yaw"), Yaw);
-    const bool bThrottleOk = SetBlueprintNumber(CachedTargetPawn, TEXT("UDP_Throttle"), Throttle);
-
-    if (bRollOk && bPitchOk && bYawOk && bThrottleOk)
-    {
-        UE_LOG(LogTemp, Verbose,
-            TEXT("[UDP->BP] Applied Roll=%.3f Pitch=%.3f Yaw=%.3f Thr=%.3f"),
-            Roll, Pitch, Yaw, Throttle);
-    }
-    else
-    {
-        UE_LOG(LogTemp, Warning, TEXT("[UDP] One or more Blueprint variables were not set on %s"),
-            *CachedTargetPawn->GetName());
-    }
-
-    // 4) Unreal -> Python ?곹깭 ?≪떊
     StateSendAccumulator += DeltaTime;
     if (StateSendAccumulator >= StateSendInterval)
     {
@@ -101,7 +93,6 @@ void AUDPControlReceiver::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     StopUDPReceiver();
     StopUDPSender();
-
     Super::EndPlay(EndPlayReason);
 }
 
@@ -187,8 +178,6 @@ void AUDPControlReceiver::ReceiveUDPData()
             FString Message = FString(UTF8_TO_TCHAR(reinterpret_cast<const char*>(ReceivedData.GetData())));
             Message = Message.Left(BytesRead);
 
-            UE_LOG(LogTemp, Warning, TEXT("[UDP] Received raw: %s"), *Message);
-
             ParseCommand(Message);
         }
     }
@@ -196,31 +185,120 @@ void AUDPControlReceiver::ReceiveUDPData()
 
 void AUDPControlReceiver::ParseCommand(const FString& Message)
 {
+    NamedControlCommands.Reset();
+    IndexedControlCommands.Reset();
+
+    if (!ParseJsonCommand(Message))
+    {
+        ParseLegacyCsvCommand(Message);
+    }
+}
+
+bool AUDPControlReceiver::ParseJsonCommand(const FString& Message)
+{
+    TSharedPtr<FJsonObject> RootObject;
+    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Message);
+    if (!FJsonSerializer::Deserialize(Reader, RootObject) || !RootObject.IsValid())
+    {
+        return false;
+    }
+
+    auto FillCommand = [](const TSharedPtr<FJsonObject>& JsonObject, FRemoteControlCommand& OutCommand)
+    {
+        OutCommand.Roll = JsonObject->GetNumberField(TEXT("roll"));
+        OutCommand.Pitch = JsonObject->GetNumberField(TEXT("pitch"));
+        OutCommand.Yaw = JsonObject->GetNumberField(TEXT("yaw"));
+        OutCommand.Throttle = JsonObject->GetNumberField(TEXT("throttle"));
+        OutCommand.bValid = true;
+    };
+
+    if (RootObject->HasTypedField<EJson::Array>(TEXT("commands")))
+    {
+        const TArray<TSharedPtr<FJsonValue>>& Commands = RootObject->GetArrayField(TEXT("commands"));
+        for (const TSharedPtr<FJsonValue>& CommandValue : Commands)
+        {
+            const TSharedPtr<FJsonObject>* CommandObject = nullptr;
+            if (!CommandValue.IsValid() || !CommandValue->TryGetObject(CommandObject) || !CommandObject || !CommandObject->IsValid())
+            {
+                continue;
+            }
+
+            FRemoteControlCommand ParsedCommand;
+            FillCommand(*CommandObject, ParsedCommand);
+            IndexedControlCommands.Add(ParsedCommand);
+
+            FString AircraftName;
+            if ((*CommandObject)->TryGetStringField(TEXT("aircraft_name"), AircraftName) && !AircraftName.IsEmpty())
+            {
+                NamedControlCommands.Add(AircraftName, ParsedCommand);
+            }
+        }
+    }
+
+    if (RootObject->HasField(TEXT("roll")) &&
+        RootObject->HasField(TEXT("pitch")) &&
+        RootObject->HasField(TEXT("yaw")) &&
+        RootObject->HasField(TEXT("throttle")))
+    {
+        FillCommand(RootObject, BroadcastCommand);
+    }
+    else if (IndexedControlCommands.Num() > 0)
+    {
+        BroadcastCommand = IndexedControlCommands[0];
+    }
+
+    Roll = static_cast<float>(BroadcastCommand.Roll);
+    Pitch = static_cast<float>(BroadcastCommand.Pitch);
+    Yaw = static_cast<float>(BroadcastCommand.Yaw);
+    Throttle = static_cast<float>(BroadcastCommand.Throttle);
+    return true;
+}
+
+void AUDPControlReceiver::ParseLegacyCsvCommand(const FString& Message)
+{
     TArray<FString> Parts;
     Message.ParseIntoArray(Parts, TEXT(","), true);
 
     if (Parts.Num() != 4)
     {
         UE_LOG(LogTemp, Error, TEXT("[UDP] Invalid message format: %s"), *Message);
+        BroadcastCommand = FRemoteControlCommand();
         return;
     }
 
-    Roll = FCString::Atof(*Parts[0]);
-    Pitch = FCString::Atof(*Parts[1]);
-    Yaw = FCString::Atof(*Parts[2]);
-    Throttle = FCString::Atof(*Parts[3]);
+    BroadcastCommand.Roll = FCString::Atof(*Parts[0]);
+    BroadcastCommand.Pitch = FCString::Atof(*Parts[1]);
+    BroadcastCommand.Yaw = FCString::Atof(*Parts[2]);
+    BroadcastCommand.Throttle = FCString::Atof(*Parts[3]);
+    BroadcastCommand.bValid = true;
 
-    UE_LOG(LogTemp, Warning,
-        TEXT("[UDP] Parsed -> Roll: %.3f Pitch: %.3f Yaw: %.3f Throttle: %.3f"),
-        Roll, Pitch, Yaw, Throttle);
+    Roll = static_cast<float>(BroadcastCommand.Roll);
+    Pitch = static_cast<float>(BroadcastCommand.Pitch);
+    Yaw = static_cast<float>(BroadcastCommand.Yaw);
+    Throttle = static_cast<float>(BroadcastCommand.Throttle);
 }
 
 APawn* AUDPControlReceiver::FindTargetPawn()
 {
+    const TArray<APawn*> MatchingPawns = FindTargetPawns(ControlledPawnNamePatterns, 1);
+    if (MatchingPawns.Num() > 0)
+    {
+        return MatchingPawns[0];
+    }
+
+    const TArray<FString> FallbackPatterns = { TargetPawnName };
+    const TArray<APawn*> FallbackPawns = FindTargetPawns(FallbackPatterns, 1);
+    return FallbackPawns.Num() > 0 ? FallbackPawns[0] : nullptr;
+}
+
+TArray<APawn*> AUDPControlReceiver::FindTargetPawns(const TArray<FString>& NamePatterns, int32 MaxCount) const
+{
+    TArray<APawn*> MatchingPawns;
+
     UWorld* World = GetWorld();
     if (!World)
     {
-        return nullptr;
+        return MatchingPawns;
     }
 
     TArray<AActor*> FoundActors;
@@ -228,19 +306,52 @@ APawn* AUDPControlReceiver::FindTargetPawn()
 
     for (AActor* Actor : FoundActors)
     {
-        if (!Actor)
+        APawn* Pawn = Cast<APawn>(Actor);
+        if (DoesPawnMatchPatterns(Pawn, NamePatterns))
         {
-            continue;
-        }
-
-        if (Actor->GetName().Contains(TargetPawnName))
-        {
-            UE_LOG(LogTemp, Warning, TEXT("[UDP] Found target pawn: %s"), *Actor->GetName());
-            return Cast<APawn>(Actor);
+            MatchingPawns.Add(Pawn);
         }
     }
 
-    return nullptr;
+    MatchingPawns.Sort([](const APawn& A, const APawn& B)
+    {
+        return A.GetName() < B.GetName();
+    });
+
+    if (MaxCount != INDEX_NONE && MatchingPawns.Num() > MaxCount)
+    {
+        MatchingPawns.SetNum(MaxCount);
+    }
+
+    return MatchingPawns;
+}
+
+bool AUDPControlReceiver::DoesPawnMatchPatterns(const APawn* Pawn, const TArray<FString>& NamePatterns) const
+{
+    if (!IsValid(Pawn))
+    {
+        return false;
+    }
+
+    if (NamePatterns.Num() == 0)
+    {
+        return TargetPawnName.IsEmpty() || Pawn->GetName().Contains(TargetPawnName);
+    }
+
+    for (const FString& Pattern : NamePatterns)
+    {
+        if (!Pattern.IsEmpty() && Pawn->GetName().Contains(Pattern))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool AUDPControlReceiver::IsUavPawn(const APawn* Pawn) const
+{
+    return IsValid(Pawn) && !UavNamePattern.IsEmpty() && Pawn->GetName().Contains(UavNamePattern);
 }
 
 bool AUDPControlReceiver::SetBlueprintNumber(APawn* Pawn, const FName VarName, double Value)
@@ -253,8 +364,6 @@ bool AUDPControlReceiver::SetBlueprintNumber(APawn* Pawn, const FName VarName, d
     FProperty* Prop = Pawn->GetClass()->FindPropertyByName(VarName);
     if (!Prop)
     {
-        UE_LOG(LogTemp, Warning, TEXT("[UDP] Property %s not found on %s"),
-            *VarName.ToString(), *Pawn->GetName());
         return false;
     }
 
@@ -270,9 +379,210 @@ bool AUDPControlReceiver::SetBlueprintNumber(APawn* Pawn, const FName VarName, d
         return true;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("[UDP] Property %s is not float/double on %s"),
-        *VarName.ToString(), *Pawn->GetName());
     return false;
+}
+
+bool AUDPControlReceiver::ApplyControlCommandToPawn(APawn* Pawn, const FRemoteControlCommand& Command)
+{
+    if (!IsValid(Pawn))
+    {
+        return false;
+    }
+
+    const bool bRollOk = SetBlueprintNumber(Pawn, TEXT("UDP_Roll"), Command.Roll);
+    const bool bPitchOk = SetBlueprintNumber(Pawn, TEXT("UDP_Pitch"), Command.Pitch);
+    const bool bYawOk = SetBlueprintNumber(Pawn, TEXT("UDP_Yaw"), Command.Yaw);
+    const bool bThrottleOk = SetBlueprintNumber(Pawn, TEXT("UDP_Throttle"), Command.Throttle);
+
+    return bRollOk && bPitchOk && bYawOk && bThrottleOk;
+}
+
+bool AUDPControlReceiver::TryGetBlueprintBool(APawn* Pawn, const FString& VarName, bool& OutValue) const
+{
+    if (!Pawn || VarName.IsEmpty())
+    {
+        return false;
+    }
+
+    if (FBoolProperty* BoolProp = FindFProperty<FBoolProperty>(Pawn->GetClass(), FName(*VarName)))
+    {
+        OutValue = BoolProp->GetPropertyValue_InContainer(Pawn);
+        return true;
+    }
+
+    return false;
+}
+
+bool AUDPControlReceiver::TryGetBlueprintInt(APawn* Pawn, const FString& VarName, int32& OutValue) const
+{
+    if (!Pawn || VarName.IsEmpty())
+    {
+        return false;
+    }
+
+    if (FIntProperty* IntProp = FindFProperty<FIntProperty>(Pawn->GetClass(), FName(*VarName)))
+    {
+        OutValue = IntProp->GetPropertyValue_InContainer(Pawn);
+        return true;
+    }
+
+    return false;
+}
+
+bool AUDPControlReceiver::TryGetBlueprintNumber(APawn* Pawn, const FString& VarName, double& OutValue) const
+{
+    if (!Pawn || VarName.IsEmpty())
+    {
+        return false;
+    }
+
+    FProperty* Prop = Pawn->GetClass()->FindPropertyByName(FName(*VarName));
+    if (!Prop)
+    {
+        return false;
+    }
+
+    if (const FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
+    {
+        OutValue = FloatProp->GetPropertyValue_InContainer(Pawn);
+        return true;
+    }
+
+    if (const FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
+    {
+        OutValue = DoubleProp->GetPropertyValue_InContainer(Pawn);
+        return true;
+    }
+
+    return false;
+}
+
+bool AUDPControlReceiver::TryGetBlueprintString(APawn* Pawn, const FString& VarName, FString& OutValue) const
+{
+    if (!Pawn || VarName.IsEmpty())
+    {
+        return false;
+    }
+
+    if (FStrProperty* StrProp = FindFProperty<FStrProperty>(Pawn->GetClass(), FName(*VarName)))
+    {
+        OutValue = StrProp->GetPropertyValue_InContainer(Pawn);
+        return true;
+    }
+
+    if (FNameProperty* NameProp = FindFProperty<FNameProperty>(Pawn->GetClass(), FName(*VarName)))
+    {
+        OutValue = NameProp->GetPropertyValue_InContainer(Pawn).ToString();
+        return true;
+    }
+
+    return false;
+}
+
+void AUDPControlReceiver::AddOptionalBoolField(const TSharedPtr<FJsonObject>& JsonObject, const FString& JsonKey, APawn* Pawn, const FString& VarName) const
+{
+    bool Value = false;
+    if (TryGetBlueprintBool(Pawn, VarName, Value))
+    {
+        JsonObject->SetBoolField(JsonKey, Value);
+    }
+    else
+    {
+        JsonObject->SetField(JsonKey, MakeShared<FJsonValueNull>());
+    }
+}
+
+void AUDPControlReceiver::AddOptionalIntField(const TSharedPtr<FJsonObject>& JsonObject, const FString& JsonKey, APawn* Pawn, const FString& VarName) const
+{
+    int32 Value = 0;
+    if (TryGetBlueprintInt(Pawn, VarName, Value))
+    {
+        JsonObject->SetNumberField(JsonKey, Value);
+    }
+    else
+    {
+        JsonObject->SetField(JsonKey, MakeShared<FJsonValueNull>());
+    }
+}
+
+void AUDPControlReceiver::AddOptionalNumberField(const TSharedPtr<FJsonObject>& JsonObject, const FString& JsonKey, APawn* Pawn, const FString& VarName) const
+{
+    double Value = 0.0;
+    if (TryGetBlueprintNumber(Pawn, VarName, Value))
+    {
+        JsonObject->SetNumberField(JsonKey, Value);
+    }
+    else
+    {
+        JsonObject->SetField(JsonKey, MakeShared<FJsonValueNull>());
+    }
+}
+
+void AUDPControlReceiver::AddOptionalStringField(const TSharedPtr<FJsonObject>& JsonObject, const FString& JsonKey, APawn* Pawn, const FString& VarName) const
+{
+    FString Value;
+    if (TryGetBlueprintString(Pawn, VarName, Value))
+    {
+        JsonObject->SetStringField(JsonKey, Value);
+    }
+    else
+    {
+        JsonObject->SetField(JsonKey, MakeShared<FJsonValueNull>());
+    }
+}
+
+UJSBSimMovementComponent* AUDPControlReceiver::FindJSBSimMovementComponent(APawn* Pawn) const
+{
+    return IsValid(Pawn) ? Pawn->FindComponentByClass<UJSBSimMovementComponent>() : nullptr;
+}
+
+TSharedPtr<FJsonObject> AUDPControlReceiver::BuildPawnState(APawn* Pawn)
+{
+    if (!IsValid(Pawn))
+    {
+        return nullptr;
+    }
+
+    const FVector Location = Pawn->GetActorLocation();
+    const FRotator Rotation = Pawn->GetActorRotation();
+    UJSBSimMovementComponent* JSBSimComponent = FindJSBSimMovementComponent(Pawn);
+
+    double SpeedKts = 0.0;
+    FRotator Attitude = Rotation;
+    double ThrottleCommand = 0.0;
+
+    const TSharedPtr<FJsonObject> PawnJson = MakeShared<FJsonObject>();
+    PawnJson->SetStringField(TEXT("aircraft_name"), Pawn->GetName());
+    PawnJson->SetNumberField(TEXT("x"), Location.X);
+    PawnJson->SetNumberField(TEXT("y"), Location.Y);
+    PawnJson->SetNumberField(TEXT("z"), Location.Z);
+
+    if (JSBSimComponent)
+    {
+        const FAircraftState& AircraftState = JSBSimComponent->AircraftState;
+        SpeedKts = AircraftState.TotalVelocityKts;
+        Attitude = AircraftState.LocalEulerAngles;
+        if (JSBSimComponent->EngineCommands.Num() > 0)
+        {
+            ThrottleCommand = JSBSimComponent->EngineCommands[0].Throttle;
+        }
+    }
+
+    const double SpeedMps = SpeedKts * KnotToMetersPerSecond;
+    PawnJson->SetNumberField(TEXT("speed_mps"), SpeedMps);
+    PawnJson->SetNumberField(TEXT("pitch"), Attitude.Pitch);
+    PawnJson->SetNumberField(TEXT("roll"), Attitude.Roll);
+    PawnJson->SetNumberField(TEXT("yaw"), Attitude.Yaw);
+    PawnJson->SetNumberField(TEXT("throttle"), ThrottleCommand);
+
+    AddOptionalStringField(PawnJson, TEXT("team"), Pawn, TeamVarName);
+
+    const TSharedPtr<FJsonObject> WeaponsJson = MakeShared<FJsonObject>();
+    AddOptionalIntField(WeaponsJson, TEXT("bullet_ammo"), Pawn, BulletAmmoVarName);
+    AddOptionalIntField(WeaponsJson, TEXT("rocket_ammo"), Pawn, RocketAmmoVarName);
+    PawnJson->SetObjectField(TEXT("weapons"), WeaponsJson);
+
+    return PawnJson;
 }
 
 void AUDPControlReceiver::SendStateToPython()
@@ -282,70 +592,44 @@ void AUDPControlReceiver::SendStateToPython()
         return;
     }
 
-    if (!CachedTargetPawn || !IsValid(CachedTargetPawn))
+    TArray<FString> Patterns = ObservedPawnNamePatterns;
+    if (Patterns.Num() == 0 && !TargetPawnName.IsEmpty())
+    {
+        Patterns.Add(TargetPawnName);
+    }
+
+    const TArray<APawn*> ObservedPawns = FindTargetPawns(Patterns);
+    if (ObservedPawns.Num() == 0)
     {
         return;
     }
 
-    const FVector Location = CachedTargetPawn->GetActorLocation();
-    const FRotator Rotation = CachedTargetPawn->GetActorRotation();
+    TArray<TSharedPtr<FJsonValue>> AircraftStates;
+    AircraftStates.Reserve(ObservedPawns.Num());
 
-    const double CurrentTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
-
-    float SpeedCmPerSec = 0.0f;
-
-    if (bHasPrevLocation)
+    for (APawn* Pawn : ObservedPawns)
     {
-        const double DeltaTime = CurrentTime - PrevStateSendTime;
-
-        if (DeltaTime > KINDA_SMALL_NUMBER)
+        if (TSharedPtr<FJsonObject> PawnState = BuildPawnState(Pawn))
         {
-            const float DistanceCm = FVector::Dist(Location, PrevLocation);
-            SpeedCmPerSec = DistanceCm / DeltaTime;
+            AircraftStates.Add(MakeShared<FJsonValueObject>(PawnState));
         }
     }
 
-    PrevLocation = Location;
-    PrevStateSendTime = CurrentTime;
-    bHasPrevLocation = true;
+    const TSharedPtr<FJsonObject> RootJson = MakeShared<FJsonObject>();
+    RootJson->SetStringField(TEXT("message_type"), TEXT("aircraft_state_batch"));
+    RootJson->SetNumberField(TEXT("count"), AircraftStates.Num());
+    RootJson->SetArrayField(TEXT("aircraft"), AircraftStates);
 
-    const float SpeedMps = SpeedCmPerSec / 100.0f;
-    const float SpeedKph = SpeedMps * 3.6f;
-
-    const float PitchDeg = Rotation.Pitch;
-    const float RollDeg = Rotation.Roll;
-    const float YawDeg = Rotation.Yaw;
-
-    const FString JsonMessage = FString::Printf(
-        TEXT("{\"aircraft_name\":\"%s\",\"speed\":%.3f,\"speed_mps\":%.3f,\"speed_kph\":%.3f,\"pitch\":%.3f,\"roll\":%.3f,\"yaw\":%.3f,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f}"),
-        *CachedTargetPawn->GetName(),
-        SpeedCmPerSec,
-        SpeedMps,
-        SpeedKph,
-        PitchDeg,
-        RollDeg,
-        YawDeg,
-        Location.X,
-        Location.Y,
-        Location.Z
-    );
+    FString JsonMessage;
+    const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonMessage);
+    FJsonSerializer::Serialize(RootJson.ToSharedRef(), Writer);
 
     FTCHARToUTF8 Convert(*JsonMessage);
     int32 BytesSent = 0;
-
-    const bool bSent = SendSocket->SendTo(
+    SendSocket->SendTo(
         reinterpret_cast<const uint8*>(Convert.Get()),
         Convert.Length(),
         BytesSent,
         *PythonAddr
     );
-
-    if (bSent)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("[UDP->PY] Sent state: %s"), *JsonMessage);
-    }
-    else
-    {
-        UE_LOG(LogTemp, Warning, TEXT("[UDP->PY] Failed to send state"));
-    }
 }
